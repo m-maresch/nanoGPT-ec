@@ -1,9 +1,13 @@
 """
 Sample from a trained model
 """
+
 import os
 import pickle
+from contextlib import nullcontext
+
 import torch
+
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
@@ -42,7 +46,7 @@ ptdtype = {
     "float16": torch.float16,
 }[dtype]
 ctx = (
-    None
+    nullcontext()
     if device_type == "cpu"
     else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 )
@@ -89,15 +93,7 @@ x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
 
 # run generation
 with torch.no_grad():
-    if ctx:
-        with ctx:
-            for k in range(num_samples):
-                y = model.generate(
-                    x, max_new_tokens, temperature=temperature, top_k=top_k
-                )
-                print(decode(y[0].tolist()))
-                print("---------------")
-    else:
+    with ctx:
         for k in range(num_samples):
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
             print(decode(y[0].tolist()))

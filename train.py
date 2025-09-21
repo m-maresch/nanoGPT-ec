@@ -20,12 +20,18 @@ import os
 import time
 import math
 import pickle
+from contextlib import nullcontext
 
 import numpy as np
 import torch
 
-from model import GPTConfig, GPT
-from loftnn import DataParallel
+from torch.distributed.optim import ZeroRedundancyOptimizer
+
+from model import GPTConfig, GPT, compute_loss, configure_optimizers
+
+import loftnn
+
+from loftnn import DataParallel, PipelineParallel
 from loftnn.types import Device
 
 # -----------------------------------------------------------------------------
@@ -75,6 +81,8 @@ dtype = (
     else "float16"
 )  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True  # use PyTorch 2.0 to compile the model to be faster
+parallelism = "pipeline"  # None, 'data', or 'pipeline'
+num_microbatches = 4  # used for pipeline parallelism
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -85,30 +93,31 @@ exec(open("configurator.py").read())  # overrides from command line or config fi
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
+is_data_parallel = parallelism == "data"
+is_pipeline_parallel = parallelism == "pipeline"
 
-is_data_parallel = DataParallel.is_available()
-if is_data_parallel:
-    data_parallel_config = DataParallel.Configuration.from_env()
+if loftnn.is_available():
+    process_config = loftnn.ProcessConfiguration.from_env()
     master_process = (
-        data_parallel_config.rank == 0
+        process_config.rank == 0
     )  # this process will do logging, checkpointing etc.
-    seed_offset = data_parallel_config.rank  # each process gets a different seed
-    # world_size number of processes will be training simultaneously, so we can scale
-    # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % data_parallel_config.world_size == 0
-    gradient_accumulation_steps //= data_parallel_config.world_size
+
+    seed_offset = 0
+    if is_data_parallel:
+        seed_offset = process_config.rank  # each process gets a different seed
+
+    if gradient_accumulation_steps > 1:
+        # world_size number of processes will be training simultaneously, so we can scale
+        # down the desired gradient accumulation iterations per process proportionally
+        assert gradient_accumulation_steps % process_config.world_size == 0
+        gradient_accumulation_steps //= process_config.world_size
 else:
     # if not data parallel, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
-    data_parallel_config = DataParallel.Configuration(
-        rank=0, local_rank=0, world_size=1
-    )
+    process_config = loftnn.ProcessConfiguration(rank=0, local_rank=0, world_size=1)
 tokens_per_iter = (
-    gradient_accumulation_steps
-    * data_parallel_config.world_size
-    * batch_size
-    * block_size
+    gradient_accumulation_steps * process_config.world_size * batch_size * block_size
 )
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
@@ -125,7 +134,7 @@ ptdtype = {
     "float16": torch.float16,
 }[dtype]
 ctx = (
-    None
+    nullcontext()
     if device_type == "cpu"
     else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 )
@@ -229,21 +238,13 @@ elif init_from.startswith("gpt2"):
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
-    model_args[
-        "block_size"
-    ] = block_size  # so that the checkpoint will have the right value
+    model_args["block_size"] = (
+        block_size  # so that the checkpoint will have the right value
+    )
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
-
-# optimizer
-optimizer = model.configure_optimizers(
-    weight_decay, learning_rate, (beta1, beta2), device_type
-)
-if init_from == "resume":
-    optimizer.load_state_dict(checkpoint["optimizer"])
-checkpoint = None  # free up memory
+scaler = torch.amp.GradScaler(enabled=(dtype == "float16"))
 
 # compile the model
 if compile:
@@ -251,30 +252,127 @@ if compile:
     unoptimized_model = model
     model = torch.compile(model)  # requires PyTorch 2.0
 
-# wrap model into data parallel container
+X, Y = get_batch("train")  # fetch the very first batch
+
+
+def loss_fn(logits, targets):
+    loss = compute_loss(logits, targets)
+    return scaler.scale(loss)
+
+
 if is_data_parallel:
-    dp_model = DataParallel(model=model, config=data_parallel_config, device=Device.cpu)
+    dist_model = DataParallel(
+        model=model, process_config=process_config, device=Device.cpu
+    )
+elif is_pipeline_parallel:
+    microbatch_sample = X.chunk(num_microbatches)[0]
+    pipeline_config = loftnn.PipelineConfiguration(
+        split_points=["transformer.h.1", "transformer.h.3"],
+        num_microbatches=num_microbatches,
+        microbatch_sample=microbatch_sample,
+        loss_fn=loss_fn,
+    )
+    dist_model = PipelineParallel(
+        model,
+        process_config=process_config,
+        pipeline_config=pipeline_config,
+        device=Device.cpu,
+    )
 else:
-    dp_model = model
+    dist_model = model
+
+no_split_or_last_process = (
+    not is_pipeline_parallel or process_config.rank == process_config.world_size - 1
+)
+
+master_or_last_process = (master_process and not is_pipeline_parallel) or (
+    is_pipeline_parallel and process_config.rank == process_config.world_size - 1
+)
+
+raw_model = model
+running_mfu = -1.0
+
+# optimizer
+optimizer = configure_optimizers(
+    dist_model.named_parameters(),
+    weight_decay,
+    learning_rate,
+    (beta1, beta2),
+    device_type,
+)
+
+if init_from == "resume":
+    optimizer.load_state_dict(checkpoint["optimizer"])
+checkpoint = None  # free up memory
+
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
-@torch.no_grad()
 def estimate_loss():
     out = {}
-    dp_model.eval()
-    for split in ["train", "val"]:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            if ctx:
+
+    with nullcontext() if is_pipeline_parallel else torch.no_grad():
+        dist_model.eval()
+
+        for split in ["train", "val"]:
+            losses = torch.zeros(eval_iters)
+            for k in range(eval_iters):
+                X, Y = get_batch(split)
                 with ctx:
-                    logits, loss = dp_model(X, Y)
-            else:
-                logits, loss = dp_model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    dp_model.train()
+                    logits, loss = dist_model(X, Y)
+                if no_split_or_last_process:
+                    losses[k] = loss.item()
+            out[split] = losses.mean()
+
+        dist_model.train()
+
     return out
+
+
+def evaluate():
+    global best_val_loss
+
+    losses = estimate_loss()
+
+    optimizer_state = None
+    if isinstance(optimizer, ZeroRedundancyOptimizer):
+        optimizer.consolidate_state_dict(to=process_config.world_size - 1)
+        if master_or_last_process:
+            optimizer_state = optimizer.state_dict()
+    else:
+        optimizer_state = optimizer.state_dict()
+    checkpoint = {
+        "model": dist_model.state_dict(),
+        "optimizer": optimizer_state,
+        "model_args": model_args,
+        "iter_num": iter_num,
+        "config": config,
+    }
+
+    if master_or_last_process:
+        print(
+            f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+        )
+        if wandb_log:
+            wandb.log(
+                {
+                    "iter": iter_num,
+                    "train/loss": losses["train"],
+                    "val/loss": losses["val"],
+                    "mfu": running_mfu * 100,  # convert to percentage
+                }
+            )
+        if losses["val"] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses["val"]
+            checkpoint["best_val_loss"] = best_val_loss
+            if iter_num > 0 and not is_pipeline_parallel:
+                print(f"saving checkpoint to {out_dir}")
+                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+
+    if is_pipeline_parallel:
+        torch.save(
+            checkpoint,
+            os.path.join(out_dir, f"ckpt-rank-{process_config.rank}.pt"),
+        )
 
 
 # learning rate decay scheduler (cosine with warmup)
@@ -299,12 +397,9 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch("train")  # fetch the very first batch
 tstart = time.time()
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
-raw_model = model
-running_mfu = -1.0
 while True:
 
     # determine and set the learning rate for this iteration
@@ -313,34 +408,9 @@ while True:
         param_group["lr"] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(
-            f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
-        )
-        if wandb_log:
-            wandb.log(
-                {
-                    "iter": iter_num,
-                    "train/loss": losses["train"],
-                    "val/loss": losses["val"],
-                    "lr": lr,
-                    "mfu": running_mfu * 100,  # convert to percentage
-                }
-            )
-        if losses["val"] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses["val"]
-            if iter_num > 0:
-                checkpoint = {
-                    "model": raw_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "model_args": model_args,
-                    "iter_num": iter_num,
-                    "best_val_loss": best_val_loss,
-                    "config": config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+    if iter_num > 0 and iter_num % eval_interval == 0:
+        evaluate()
+
     if iter_num == 0 and eval_only:
         break
 
@@ -355,25 +425,26 @@ while True:
             model.require_backward_grad_sync = (
                 micro_step == gradient_accumulation_steps - 1
             )
-        if ctx:
-            with ctx:
-                logits, loss = dp_model(X, Y)
-                loss = (
-                    loss / gradient_accumulation_steps
-                )  # scale the loss to account for gradient accumulation
-        else:
-            logits, loss = dp_model(X, Y)
+        with ctx:
+            logits, loss = dist_model(X, Y)
+
+        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+        X, Y = get_batch("train")
+
+        if no_split_or_last_process:
             loss = (
                 loss / gradient_accumulation_steps
             )  # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch("train")
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
+
+        if not is_pipeline_parallel:
+            # backward pass, with gradient scaling if training in fp16
+            scaler.scale(loss).backward()
+
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        torch.nn.utils.clip_grad_norm_(dist_model.parameters(), grad_clip)
+
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
@@ -384,7 +455,7 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-    if iter_num % log_interval == 0 and master_process:
+    if iter_num % log_interval == 0 and master_or_last_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
@@ -404,5 +475,8 @@ while True:
 tend = time.time()
 print(f"Training ran for {(tend - tstart):.2f} seconds")
 
-if is_data_parallel:
-    dp_model.cleanup()
+print("Evaluating")
+evaluate()
+
+if loftnn.is_available():
+    dist_model.cleanup()
