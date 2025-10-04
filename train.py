@@ -256,13 +256,16 @@ X, Y = get_batch("train")  # fetch the very first batch
 
 
 def loss_fn(logits, targets):
+    logits = logits.to(device)
     loss = compute_loss(logits, targets)
     return scaler.scale(loss)
 
 
 if is_data_parallel:
     dist_model = DataParallel(
-        model=model, process_config=process_config, device=Device.cpu
+        model=model,
+        process_config=process_config,
+        device=Device.cuda if device_type == "cuda" else Device.cpu,
     )
 elif is_pipeline_parallel:
     microbatch_sample = X.chunk(num_microbatches)[0]
@@ -276,7 +279,7 @@ elif is_pipeline_parallel:
         model,
         process_config=process_config,
         pipeline_config=pipeline_config,
-        device=Device.cpu,
+        device=Device.cpu,  # all nodes must use cpu here
     )
 else:
     dist_model = model
