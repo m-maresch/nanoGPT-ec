@@ -31,7 +31,7 @@ from model import GPTConfig, GPT, compute_loss, configure_optimizers
 
 import loftnn
 
-from loftnn import DataParallel, PipelineParallel
+from loftnn import DataParallel, HybridPipelineParallel, PipelineParallel
 from loftnn.types import Device
 
 # -----------------------------------------------------------------------------
@@ -81,7 +81,7 @@ dtype = (
     else "float16"
 )  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True  # use PyTorch 2.0 to compile the model to be faster
-parallelism = "pipeline"  # None, 'data', or 'pipeline'
+parallelism = "hybrid"  # None, 'data', 'pipeline' or 'hybrid'
 num_microbatches = 4  # used for pipeline parallelism
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -95,6 +95,7 @@ config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 
 is_data_parallel = parallelism == "data"
 is_pipeline_parallel = parallelism == "pipeline"
+is_hybrid_pipeline_parallel = parallelism == "hybrid"
 
 if loftnn.is_available():
     process_config = loftnn.ProcessConfiguration.from_env()
@@ -275,21 +276,45 @@ elif is_pipeline_parallel:
         microbatch_sample=microbatch_sample,
         loss_fn=loss_fn,
     )
+
     dist_model = PipelineParallel(
         model,
         process_config=process_config,
         pipeline_config=pipeline_config,
         device=Device.cpu,  # all nodes must use cpu here
     )
+elif is_hybrid_pipeline_parallel:
+    microbatch_sample = X.chunk(num_microbatches)[0]
+    pipeline_config = loftnn.HybridPipelineConfiguration(
+        num_microbatches=num_microbatches,
+        microbatch_sample=microbatch_sample,
+        loss_fn=loss_fn,
+    )
+
+    dist_model = HybridPipelineParallel(
+        model,
+        process_config=process_config,
+        hybrid_pipeline_config=pipeline_config,
+        device=Device.cpu,  # all nodes must use cpu here
+    )
+
+    split_points, device_groups, samples_allocated = dist_model.compute_plan()
+
+    split_points = [2]
+    device_groups = [2]
+
+    dist_model.prepare_schedule(split_points, device_groups, samples_allocated)
 else:
     dist_model = model
 
+has_pipeline_parallelism = is_pipeline_parallel or is_hybrid_pipeline_parallel
+
 no_split_or_last_process = (
-    not is_pipeline_parallel or process_config.rank == process_config.world_size - 1
+    not has_pipeline_parallelism or process_config.rank == process_config.world_size - 1
 )
 
-master_or_last_process = (master_process and not is_pipeline_parallel) or (
-    is_pipeline_parallel and process_config.rank == process_config.world_size - 1
+master_or_last_process = (master_process and not has_pipeline_parallelism) or (
+    has_pipeline_parallelism and process_config.rank == process_config.world_size - 1
 )
 
 raw_model = model
@@ -313,7 +338,7 @@ checkpoint = None  # free up memory
 def estimate_loss():
     out = {}
 
-    with nullcontext() if is_pipeline_parallel else torch.no_grad():
+    with nullcontext() if has_pipeline_parallelism else torch.no_grad():
         dist_model.eval()
 
         for split in ["train", "val"]:
@@ -367,11 +392,11 @@ def evaluate():
         if losses["val"] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses["val"]
             checkpoint["best_val_loss"] = best_val_loss
-            if iter_num > 0 and not is_pipeline_parallel:
+            if iter_num > 0 and not has_pipeline_parallelism:
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
 
-    if is_pipeline_parallel:
+    if has_pipeline_parallelism:
         torch.save(
             checkpoint,
             os.path.join(out_dir, f"ckpt-rank-{process_config.rank}.pt"),
@@ -439,7 +464,7 @@ while True:
                 loss / gradient_accumulation_steps
             )  # scale the loss to account for gradient accumulation
 
-        if not is_pipeline_parallel:
+        if not has_pipeline_parallelism:
             # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()
 
