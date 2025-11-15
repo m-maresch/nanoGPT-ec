@@ -32,7 +32,7 @@ from model import GPTConfig, GPT, compute_loss, configure_optimizers
 import loftnn
 
 from loftnn import DataParallel, HybridPipelineParallel, PipelineParallel
-from loftnn.types import Device
+from loftnn.types import Device, Worker
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -124,7 +124,14 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+
+
+def seed():
+    torch.manual_seed(1337 + seed_offset)
+
+
+seed()
+
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 device_type = "cuda" if "cuda" in device else "cpu"  # for later use in torch.autocast
@@ -298,12 +305,24 @@ elif is_hybrid_pipeline_parallel:
         device=Device.cpu,  # all nodes must use cpu here
     )
 
-    split_points, device_groups, samples_allocated = dist_model.compute_plan()
-
-    split_points = [2]
-    device_groups = [2]
+    compute_plan = False
+    if compute_plan:
+        split_points, device_groups, samples_allocated = dist_model.compute_plan()
+    else:
+        split_points = [2]
+        device_groups = [2]
+        samples_allocated = [
+            {
+                Worker(rank=0, compute_capacity=1 / 1000, available_memory=4 * 20): 2,
+                Worker(rank=1, compute_capacity=1 / 1000, available_memory=4 * 20): 1,
+            },
+            {Worker(rank=2, compute_capacity=1 / 1000, available_memory=4 * 20): 3},
+        ]
 
     dist_model.prepare_schedule(split_points, device_groups, samples_allocated)
+
+    # computing the plan advances the RNG of the master process
+    seed()  # needed to make sure that X and Y are aligned during training
 else:
     dist_model = model
 
