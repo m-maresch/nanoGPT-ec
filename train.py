@@ -16,6 +16,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 
+import logging
 import os
 import time
 import math
@@ -32,6 +33,7 @@ from model import GPTConfig, GPT, compute_loss, configure_optimizers
 import loftnn
 
 from loftnn import DataParallel, HybridPipelineParallel, PipelineParallel
+from loftnn.configuration import HybridPipelinePlanningAlgorithm
 from loftnn.types import Device, Worker
 
 # -----------------------------------------------------------------------------
@@ -40,6 +42,7 @@ from loftnn.types import Device, Worker
 out_dir = "out"
 eval_interval = 2000
 log_interval = 1
+log_level = "WARNING"
 eval_iters = 200
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = True  # if True, always save a checkpoint after each eval
@@ -50,8 +53,8 @@ wandb_project = "owt"
 wandb_run_name = "gpt2"  # 'run' + str(time.time())
 # data
 dataset = "openwebtext"
-gradient_accumulation_steps = 5 * 8  # used to simulate larger batch sizes
-batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 1  # used to simulate larger batch sizes
+batch_size = 12
 block_size = 1024
 # model
 n_layer = 12
@@ -81,23 +84,41 @@ dtype = (
     else "float16"
 )  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True  # use PyTorch 2.0 to compile the model to be faster
+# parallelism
 parallelism = "hybrid"  # None, 'data', 'pipeline' or 'hybrid'
-num_microbatches = 4  # used for pipeline parallelism
+# pipeline parallelism
+num_microbatches = 4
+# hybrid pipeline parallelism
+planner = HybridPipelinePlanningAlgorithm.exact
+compute_capacities = []
+batch_size_limits = []
+split_points = []
+device_groups = []
+samples_allocated = []
+activation_checkpointing_budgets = []
+# other
+plot = False
+
 # -----------------------------------------------------------------------------
 config_keys = [
     k
     for k, v in globals().items()
-    if not k.startswith("_") and isinstance(v, (int, float, bool, str))
+    if not k.startswith("_") and isinstance(v, (int, float, bool, str, list))
 ]
 exec(open("configurator.py").read())  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
+logging.basicConfig(level=log_level)
+
 is_data_parallel = parallelism == "data"
 is_pipeline_parallel = parallelism == "pipeline"
 is_hybrid_pipeline_parallel = parallelism == "hybrid"
 
+has_pipeline_parallelism = is_pipeline_parallel or is_hybrid_pipeline_parallel
+
 if loftnn.is_available():
+    print("LoftNN is available")
     process_config = loftnn.ProcessConfiguration.from_env()
     master_process = (
         process_config.rank == 0
@@ -108,11 +129,15 @@ if loftnn.is_available():
         seed_offset = process_config.rank  # each process gets a different seed
 
     if gradient_accumulation_steps > 1:
+        assert (
+            not has_pipeline_parallelism
+        ), "misconfiguration: gradient accumulation used with pipeline parallelism"
         # world_size number of processes will be training simultaneously, so we can scale
         # down the desired gradient accumulation iterations per process proportionally
         assert gradient_accumulation_steps % process_config.world_size == 0
         gradient_accumulation_steps //= process_config.world_size
 else:
+    print("LoftNN is not available")
     # if not data parallel, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
@@ -143,8 +168,7 @@ ptdtype = {
 }[dtype]
 ctx = (
     nullcontext()
-    if device_type == "cpu"
-    else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    # torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 )
 
 # poor man's data loader
@@ -254,6 +278,11 @@ model.to(device)
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.amp.GradScaler(enabled=(dtype == "float16"))
 
+if plot and master_process:
+    from loftnn.tools.plot import plot_parameters_by_layer
+
+    plot_parameters_by_layer(model)
+
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -278,7 +307,7 @@ if is_data_parallel:
 elif is_pipeline_parallel:
     microbatch_sample = X.chunk(num_microbatches)[0]
     pipeline_config = loftnn.PipelineConfiguration(
-        split_points=["transformer.h.1", "transformer.h.3"],
+        split_points=split_points,
         num_microbatches=num_microbatches,
         microbatch_sample=microbatch_sample,
         loss_fn=loss_fn,
@@ -288,11 +317,11 @@ elif is_pipeline_parallel:
         model,
         process_config=process_config,
         pipeline_config=pipeline_config,
-        device=Device.cpu,  # all nodes must use cpu here
     )
 elif is_hybrid_pipeline_parallel:
     microbatch_sample = X.chunk(num_microbatches)[0]
     pipeline_config = loftnn.HybridPipelineConfiguration(
+        planner=planner,
         num_microbatches=num_microbatches,
         microbatch_sample=microbatch_sample,
         loss_fn=loss_fn,
@@ -302,31 +331,48 @@ elif is_hybrid_pipeline_parallel:
         model,
         process_config=process_config,
         hybrid_pipeline_config=pipeline_config,
-        device=Device.cpu,  # all nodes must use cpu here
+        device=Device.cuda if device_type == "cuda" else Device.cpu,
     )
 
-    compute_plan = False
-    if compute_plan:
-        split_points, device_groups, samples_allocated = dist_model.compute_plan()
-    else:
-        split_points = [2]
-        device_groups = [2]
+    if split_points and device_groups and samples_allocated:
+        device_groups_complete = [0] + device_groups + [process_config.world_size]
         samples_allocated = [
             {
-                Worker(rank=0, compute_capacity=1 / 1000, available_memory=4 * 20): 2,
-                Worker(rank=1, compute_capacity=1 / 1000, available_memory=4 * 20): 1,
-            },
-            {Worker(rank=2, compute_capacity=1 / 1000, available_memory=4 * 20): 3},
+                Worker(
+                    rank=r,
+                    compute_capacity=(
+                        compute_capacities[r] if compute_capacities else 1 / 1000
+                    ),
+                    batch_size_limits=(
+                        batch_size_limits[r] if batch_size_limits else 100
+                    ),
+                ): samples_allocated[r]
+                for r in range(device_groups_complete[g], device_groups_complete[g + 1])
+            }
+            for g in range(len(device_groups_complete) - 1)
         ]
+    else:
+        (
+            split_points,
+            device_groups,
+            samples_allocated,
+            activation_checkpointing_budgets,
+        ) = dist_model.compute_plan(batch_size_limits)
 
-    dist_model.prepare_schedule(split_points, device_groups, samples_allocated)
+    print("using hybrid pipeline parallelism with the following plan:")
+    print(f"    split points = {split_points}")
+    print(f"    device groups = {device_groups}")
+    print(f"    samples allocated = {samples_allocated}")
+    print(f"    activation checkpointing budgets = {activation_checkpointing_budgets}")
+
+    dist_model.prepare_schedule(
+        split_points, device_groups, samples_allocated, activation_checkpointing_budgets
+    )
 
     # computing the plan advances the RNG of the master process
     seed()  # needed to make sure that X and Y are aligned during training
 else:
     dist_model = model
-
-has_pipeline_parallelism = is_pipeline_parallel or is_hybrid_pipeline_parallel
 
 no_split_or_last_process = (
     not has_pipeline_parallelism or process_config.rank == process_config.world_size - 1
@@ -446,9 +492,9 @@ if wandb_log and master_process:
 # training loop
 tstart = time.time()
 t0 = time.time()
+dts = []
 local_iter_num = 0  # number of iterations in the lifetime of this process
 while True:
-
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
@@ -457,6 +503,7 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num > 0 and iter_num % eval_interval == 0:
         evaluate()
+        t0 = time.time()
 
     if iter_num == 0 and eval_only:
         break
@@ -501,6 +548,7 @@ while True:
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
+    dts.append(dt)
     t0 = t1
     if iter_num % log_interval == 0 and master_or_last_process:
         # get loss as float. note: this is a CPU-GPU sync point
@@ -521,9 +569,7 @@ while True:
 
 tend = time.time()
 print(f"Training ran for {(tend - tstart):.2f} seconds")
-
-print("Evaluating")
-evaluate()
+print(f"Iter times: {dts} seconds")
 
 if loftnn.is_available():
     dist_model.cleanup()
