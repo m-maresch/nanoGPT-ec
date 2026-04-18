@@ -21,6 +21,7 @@ import os
 import time
 import math
 import pickle
+import sys
 from contextlib import nullcontext
 
 import numpy as np
@@ -35,6 +36,7 @@ import loftnn
 from loftnn import DataParallel, HybridPipelineParallel, PipelineParallel
 from loftnn.configuration import HybridPipelinePlanningAlgorithm
 from loftnn.types import Device, Worker
+from loftnn.worker_utils import free_memory, initially_free_memory, total_memory
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -96,8 +98,10 @@ split_points = []
 device_groups = []
 samples_allocated = []
 activation_checkpointing_budgets = []
+use_ambp = True
 # other
 plot = False
+run_experiments = False
 
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -278,18 +282,43 @@ model.to(device)
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.amp.GradScaler(enabled=(dtype == "float16"))
 
-if plot and master_process:
-    from loftnn.tools.plot import plot_parameters_by_layer
+X, Y = get_batch("train")  # fetch the very first batch
 
+if plot and master_process:
+    from loftnn.tools.plot import plot_model, plot_parameters_by_layer
+
+    plot_model(model, "gpt", X, Y)
     plot_parameters_by_layer(model)
+
+if run_experiments:
+    from loftnn.experiments import ExperimentRunner
+    from loftnn.worker_groups import randomized_worker_group
+
+    import loftnn.experiment_planning_time_scaling
+
+    configurations = [
+        (
+            f"GPT with {i} workers",
+            model,
+            torch.Size([320, block_size]),
+            X.dtype,
+            randomized_worker_group(i, batch_size_limit=320),
+            320,
+            4,
+            False,
+            Device.cuda if device_type == "cuda" else Device.cpu,
+        )
+        for i in range(3, 10 + 1)
+    ]
+    ExperimentRunner.run_all(configurations)
+
+    sys.exit()
 
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model)  # requires PyTorch 2.0
-
-X, Y = get_batch("train")  # fetch the very first batch
 
 
 def loss_fn(logits, targets):
@@ -317,6 +346,7 @@ elif is_pipeline_parallel:
         model,
         process_config=process_config,
         pipeline_config=pipeline_config,
+        device=Device.cuda if device_type == "cuda" else Device.cpu,
     )
 elif is_hybrid_pipeline_parallel:
     microbatch_sample = X.chunk(num_microbatches)[0]
@@ -357,7 +387,7 @@ elif is_hybrid_pipeline_parallel:
             device_groups,
             samples_allocated,
             activation_checkpointing_budgets,
-        ) = dist_model.compute_plan(batch_size_limits)
+        ) = dist_model.compute_plan(use_ambp, batch_size_limits)
 
     print("using hybrid pipeline parallelism with the following plan:")
     print(f"    split points = {split_points}")
@@ -493,6 +523,7 @@ if wandb_log and master_process:
 tstart = time.time()
 t0 = time.time()
 dts = []
+losses = []
 local_iter_num = 0  # number of iterations in the lifetime of this process
 while True:
     # determine and set the learning rate for this iteration
@@ -542,6 +573,13 @@ while True:
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
+
+    if local_iter_num == 0:
+        print(f"memory usage: {total_memory(device) - free_memory(device):,}")
+        print(
+            f"    of training: {initially_free_memory(device) - free_memory(device):,}"
+        )
+
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
@@ -554,6 +592,8 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        losses.append(lossf)
+
         if local_iter_num >= 5:  # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
@@ -564,12 +604,13 @@ while True:
     local_iter_num += 1
 
     # termination conditions
-    if iter_num > max_iters:
+    if iter_num >= max_iters:
         break
 
 tend = time.time()
 print(f"Training ran for {(tend - tstart):.2f} seconds")
 print(f"Iter times: {dts} seconds")
+print(f"Losses: {losses}")
 
 if loftnn.is_available():
     dist_model.cleanup()
