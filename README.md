@@ -1,6 +1,6 @@
 # GPT model training with LoftNN
 
-This repository adapts nanoGPT to integrate the parallelism types provided by [LoftNN](https://github.com/m-maresch/loftnn).
+This repository adapts nanoGPT to integrate the parallelism types provided by [LoftNN](https://github.com/m-maresch/loftnn) for distributed training.
 
 ## Example usage
 ```
@@ -12,6 +12,8 @@ python train.py config/train_openwebtext_char_medium.py --device=cuda --parallel
 
 python train.py config/train_openwebtext_char_medium.py --device=cuda --parallelism='hybrid' --log_level="INFO" --planner="exact"
 ```
+
+Note that multiple environment variables need to be set for LoftNN to be available for distributed training. See details [here](https://github.com/m-maresch/loftnn#example-usage).
 
 Original README:
 
